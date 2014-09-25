@@ -1,0 +1,12 @@
+name = Fish Vocabulary: Condition
+core = 7.x
+package = Fish
+version = 7.x-1.0
+project = fish_vocab_condition
+dependencies[] = features
+dependencies[] = number
+dependencies[] = taxonomy
+features[features_api][] = api:2
+features[field_base][] = field_value
+features[field_instance][] = taxonomy_term-condition-field_value
+features[taxonomy][] = condition
