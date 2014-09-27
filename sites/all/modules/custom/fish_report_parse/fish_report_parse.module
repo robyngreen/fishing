@@ -1,0 +1,385 @@
+<?php
+/**
+ * @file
+ * Code for Fish Report Parser module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function fish_report_parse_menu() {
+  $items = array();
+  $items['parse'] = array(
+    'title' => 'Fishing Reports Parser',
+    'page callback' => 'fish_report_parse_display',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM
+  );
+  return $items;
+}
+
+/**
+ * Display function for parser menu callback.
+ */
+function fish_report_parse_display() {
+  //fish_report_parse_parse();
+  fish_report_parse_reports();
+  return 'parsed';
+}
+
+function fish_report_parse_parse() {
+  $raw_html = drupal_static(__FUNCTION__);
+  $reports_url = 'http://www.agfc.com/fishing/Pages/FishingReports.aspx';
+  $output = '';
+
+  if (!isset($raw_html)) {
+    if ($cache = cache_get('fish_reports_html')) {
+      $raw_html = $cache->data;
+    }
+    else {
+      $request = drupal_http_request($reports_url);
+      if (!isset($request->error)) {
+        $raw_html = $request->data;
+        cache_set('fish_reports_html', $raw_html, 'cache');
+      }
+    }
+  }
+
+  $raw_reports = array();
+  $pattern = '/href=\"(.*?)\" target=\"\_blank\">(.*?fishing report.*?)<\/a><\/td><td class=\"tableCell\" style=\"width\: .*?px\">WEB/i';
+  preg_match_all($pattern, $raw_html, $raw_reports);
+  $i = 0;
+  foreach ($raw_reports[2] as $index => $title_string) {
+    $title = $raw_reports[2][$index];
+    $report_date = fish_report_parse_clean_date($raw_reports[2][$index]);
+    $unix_time = strtotime($report_date);
+    $url = $raw_reports[1][$index];
+    $tmp = array(
+      'title' => $title,
+      'url' => $url,
+      'orig_date' => $report_date,
+      'mod_date' => date("Y-m-d H:i:s", $unix_time),
+      'unix' => $unix_time,
+    );
+    if ($i++ < 10) {
+      fish_report_parse_create_report($tmp);
+    }
+  }
+  fish_report_parse_reports();
+}
+
+/**
+ * Create Report
+ *
+ * Creates original_report node.
+ *
+ * @param array $data
+ *   Keyed array of data used to build node.
+ */
+function fish_report_parse_create_report($data) {
+  $report = '';
+  if ($individual_reports_cache = cache_get('report-' . $data['unix'])) {
+    dpm($data['title'] . ' already in cache, skipping http pull. Getting text from cache.');
+    // Fix for bad data.
+    $report = $individual_reports_cache->data;
+    if ($individual_reports_cache->data == '404') {
+      cache_set('report-' . $data['unix'], 'error', 'cache');
+      $report = 'error';
+    }
+  }
+  else {
+    dpm('Getting ' . $data['title']);
+    $individual_report_request = drupal_http_request($data['url']);
+    if (!isset($individual_report_request->error)) {
+      $report = $individual_report_request->data;
+      cache_set('report-' . $data['unix'], $individual_report_request->data, 'cache');
+    }
+    else {
+      cache_set('report-' . $data['unix'], 'error', 'cache');
+      $report = 'error';
+    }
+  }
+
+  $node = new stdClass();
+  $node->title = $data['title'];
+  $node->type = 'original_report';
+  node_object_prepare($node);
+  $node->language = LANGUAGE_NONE;
+  $node->uid = 1;
+  $node->body[$node->language][0]['value'] = $report;
+  $node->field_date[$node->language][]['value'] = $data['unix'];
+  $node->field_url[$node->language][]['url'] = $data['url'];
+  node_save($node);
+}
+
+/**
+ * Cleans Dates.
+ *
+ * Cleans data from AGF text.
+ *
+ * @param string $raw_date
+ *   Raw date from website.
+ *
+ * @return string
+ *   Cleaned date string.
+ */
+function fish_report_parse_clean_date($raw_date) {
+  // Remove Weekly | Fishing | report from string for date.
+  $words = array(
+    '/\bweekly\b/i',
+    '/\bfishing\b/i',
+    '/\breport\b/i',
+  );
+  $raw_date = preg_replace($words, '', $raw_date);
+  $raw_date = preg_replace('/[^A-Za-z0-9\s,]/', '', $raw_date);
+  $raw_date = trim($raw_date);
+  // Fix typo on ARGF site.
+  $raw_date = ($raw_date === 'March, 7, 2012') ? 'March 7, 2012' : $raw_date;
+  return $raw_date;
+}
+
+/**
+ * Loops through unparsed original nodes and creates reports.
+ */
+function fish_report_parse_reports() {
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'original_report')
+    ->propertyCondition('status', 1)
+    ->fieldCondition('field_parsed', 'value', '0', '=')
+    ->addMetaData('account', user_load(1));
+  $result = $query->execute();
+  if (isset($result['node'])) {
+    $report_item_nids = array_keys($result['node']);
+    $report_items = entity_load('node', $report_item_nids);
+  }
+  foreach ($report_items as $node) {
+    dpm("Report (" . $node->title . ') ' . $node->field_url[LANGUAGE_NONE][0]['url']);
+    fish_report_parse_lake($node->body[LANGUAGE_NONE][0]['value']);
+    fish_report_parse_individual($node->body[LANGUAGE_NONE][0]['value']);
+  }
+}
+
+/**
+ * Process Lake.
+ *
+ * Extracts lakes from body of report.
+ *
+ * @param string $text
+ *   Raw report HTML text.
+ */
+function fish_report_parse_lake($text) {
+  $seen_lakes = fish_report_parse_build_lakes();
+  $lakes = array();
+  if (preg_match_all("/<.*?<strong>.*?<\/div>/i", $text, $lakes)) {
+    foreach ($lakes[0] as $lake) {
+      $sublake = array();
+      $raw_lake = '';
+      if (preg_match_all("/<.*?font-size\: 12pt;.*?<\/div>/i", $lake, $sublake)) {
+        $raw_lake = $sublake[0][0];
+      }
+      if (preg_match_all("/<.*?color: (#8f3c1e|rgb\(143, 60, 30\));.*?<\/div>/i", $lake, $sublake)) {
+        $raw_lake = $sublake[0][0];
+      }
+      if ($raw_lake != '') {
+        $raw_lake = strip_tags($sublake[0][0]);
+        $raw_lake = fish_report_parse_clean($raw_lake);
+        $raw_lake = trim($raw_lake);
+        $raw_lake = ($raw_lake === 'Greers FerryLake') ? 'Greers Ferry Lake' : $raw_lake;
+        if (stripos($raw_lake, 'Just Fishing Guides') === FALSE) {
+          if (!in_array($raw_lake, $seen_lakes)) {
+            $term = new stdClass();
+            $term->name = $raw_lake;
+            $term->vid = $vocabulary->vid;
+            if (preg_match("/href=('|\")(.*?)('|\")/",$sublake[0][0], $link)) {
+              $link[2] = trim($link[2]);
+              $request = drupal_http_request($link[2]);
+              if (!isset($request->error)) {
+                $raw_html = $request->data;
+                if (preg_match("/<div id=\"lat.*?display\: none;\">(.*?)<\/div></si",$raw_html,$lat)
+                    && preg_match("/<div id=\"long.*?display\: none;\">(.*?)<\/div>/si",$raw_html,$lon)) {
+                  $term->field_location[LANGUAGE_NONE][] = array(
+                    'lat' => $lat[1],
+                    'lon' => $lon[1],
+                  );
+                }
+              }
+            }
+            taxonomy_term_save($term);
+            $seen_lakes[$term->tid] = $raw_lake;
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Process Individual.
+ *
+ * Processes individual reports.
+ *
+ * @param string $text
+ *   Raw report HTML text.
+ */
+function fish_report_parse_individual($text) {
+  // Each report is a paragraph. Get all html removed, then parse by line.
+  $filtered_data = array();
+  $all_reports = array();
+  $lakes = fish_report_parse_build_lakes();
+  $text = fish_report_parse_clean($text);
+  preg_match("/<div class=\"e2ma-layout-wrap\">(.*?)<\/div><\/span><\/td>/si", $text, $filtered_data);
+  if (empty($filtered_data)) {
+    preg_match("/name=\"central\".*?>Central Arkansas(.*?)<\/tbody><\/table>/si", $text, $filtered_data);
+  }
+  if (empty($filtered_data)) {
+    preg_match("/name=\"central-arkansas\".*?>(.*?)e2ma-design-option-footer/si", $text, $filtered_data);
+  }
+  $all_reports = explode("\n", $filtered_data[1]);
+  $all_reports = array_filter($all_reports, 'fish_report_parse_remove_titles');
+  $all_reports = array_filter($all_reports);
+  $current_lake_tid = '';
+  $current_lake_name = '';
+  $reports_to_save = array();
+  foreach ($all_reports as $report) {
+    $report = trim(strip_tags($report));
+    if (!empty($report)) {
+      if (in_array($report, $lakes)) {
+        $current_lake_tid = array_search($report, $lakes);
+        $current_lake_name = $report;
+      }
+      else {
+        if (!empty($current_lake_tid)) {
+          $fishing = fish_report_parse_process_fish($report);
+          $reports_to_save[$current_lake_tid][] = array(
+            'lake' => $current_lake_name,
+            'report' => $report,
+            'fishing' => $fishing,
+          );
+        }
+      }
+    }
+  }
+  dpm($reports_to_save);
+}
+
+/**
+ * Process Fish
+ *
+ * Builds fish condition object.
+ *
+ * @param string $text
+ *   Raw text from website.
+ *
+ * @return string
+ *   Cleans string.
+ */
+function fish_report_parse_process_fish($report) {
+  $fishes = fish_report_parse_build_fishes();
+  $conditions = fish_report_parse_build_conditions();
+  $fishing_report = array();
+  foreach ($fishes as $fish) {
+    if (stripos($report, $fish) !== FALSE) {
+      foreach ($conditions as $condition) {
+        if (preg_match("/" . $fish . "(ing|)( fishing| reports|) (are|is|have\sbeen)(\sbiting|\sdone|)(\sfairly|\svery|) " . $condition . "(\s|\.)/i", $report)) {
+          $fishing_report[] = $fish . ' is ' . $condition;
+        }
+      }
+    }
+  }
+  return $fishing_report;
+}
+
+/**
+ * Cleans String.
+ *
+ * Cleans string of bad data.
+ *
+ * @param string $text
+ *   Raw text from website.
+ *
+ * @return string
+ *   Cleans string.
+ */
+function fish_report_parse_clean($text) {
+  $text = str_replace(" ", "", $text);
+  return $text;
+}
+
+/**
+ * Builds taxonomy lakes and stores in memory.
+ *
+ * @return array
+ *   Array of lakes.
+ */
+function fish_report_parse_build_lakes() {
+  $lakes = drupal_static(__FUNCTION__);
+  if (!isset($lakes)) {
+    $vocabulary = taxonomy_vocabulary_machine_name_load('Lake');
+    $terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
+    foreach ($terms as $term) {
+      $lakes[$term->tid] = $term->name;
+    }
+  }
+  return $lakes;
+}
+
+/**
+ * Builds taxonomy fishes and stores in memory.
+ *
+ * @return array
+ *   Array of fishes.
+ */
+function fish_report_parse_build_fishes() {
+  $fish = drupal_static(__FUNCTION__);
+  if (!isset($fish)) {
+    $vocabulary = taxonomy_vocabulary_machine_name_load('fish_type');
+    $terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
+    foreach ($terms as $term) {
+      $fish[$term->tid] = $term->name;
+      // @Todo: how would you Drupalize this so it's in the CMS? Parent/child and only use children?
+      /*if($term->name == 'bream') {
+        $fish[$term->tid]= 'bluegill';
+        $fish[$term->tid] = 'readear';
+        $fish[$term->tid] = 'redear';
+      }*/
+    }
+  }
+  return $fish;
+}
+
+/**
+ * Builds taxonomy conditions and stores in memory.
+ *
+ * @return array
+ *   Array of conditions.
+ */
+function fish_report_parse_build_conditions() {
+  $conditions = drupal_static(__FUNCTION__);
+  if (!isset($conditions)) {
+    $vocabulary = taxonomy_vocabulary_machine_name_load('condition');
+    $terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
+    foreach ($terms as $term) {
+      $conditions[$term->tid] = $term->name;
+    }
+  }
+  return $conditions;
+}
+
+/**
+ * Remove title.
+ *
+ * Callback from array_filter to remove strings..
+ *
+ * @param string $var
+ *   Array elements.
+ *
+ * @return bool
+ *   True or False to remove.
+ */
+function fish_report_parse_remove_titles($var) {
+  if (stripos($var, 'font-size: 14pt') !== FALSE || stripos($var, 'Army Corps of Engineers reports the') !== FALSE) {
+    return FALSE;
+  }
+  return TRUE;
+}
