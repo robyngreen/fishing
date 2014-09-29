@@ -4,6 +4,8 @@
  * Code for Fish Report Parser module.
  */
 
+// @todo: when a original_report is marked unparsed, all reports from it need to be deleted.
+
 /**
  * Implements hook_menu().
  */
@@ -22,8 +24,9 @@ function fish_report_parse_menu() {
  * Display function for parser menu callback.
  */
 function fish_report_parse_display() {
-  //fish_report_parse_parse();
-  fish_report_parse_reports();
+  fish_report_parse_parse();
+  //fish_report_parse_reports();
+  // Should we do fish/condition parsing here, or in parse_reports?
   return 'parsed';
 }
 
@@ -61,11 +64,10 @@ function fish_report_parse_parse() {
       'mod_date' => date("Y-m-d H:i:s", $unix_time),
       'unix' => $unix_time,
     );
-    if ($i++ < 10) {
+    //if ($i++ < 25) {
       fish_report_parse_create_report($tmp);
-    }
+    //}
   }
-  fish_report_parse_reports();
 }
 
 /**
@@ -149,6 +151,7 @@ function fish_report_parse_reports() {
     ->fieldCondition('field_parsed', 'value', '0', '=')
     ->addMetaData('account', user_load(1));
   $result = $query->execute();
+  // This could be slow - we just need the body text and nid, not the whole node.
   if (isset($result['node'])) {
     $report_item_nids = array_keys($result['node']);
     $report_items = entity_load('node', $report_item_nids);
@@ -156,7 +159,9 @@ function fish_report_parse_reports() {
   foreach ($report_items as $node) {
     dpm("Report (" . $node->title . ') ' . $node->field_url[LANGUAGE_NONE][0]['url']);
     fish_report_parse_lake($node->body[LANGUAGE_NONE][0]['value']);
-    fish_report_parse_individual($node->body[LANGUAGE_NONE][0]['value']);
+    $body = field_get_items('node', $node, 'body');
+    $date = field_get_items('node', $node, 'field_date');
+    fish_report_parse_individual($node->nid, $body[0]['value'], $date[0]['value']);
   }
 }
 
@@ -169,7 +174,7 @@ function fish_report_parse_reports() {
  *   Raw report HTML text.
  */
 function fish_report_parse_lake($text) {
-  $seen_lakes = fish_report_parse_build_lakes();
+  $seen_lakes = fish_report_parse_build_term_data('lake');
   $lakes = array();
   if (preg_match_all("/<.*?<strong>.*?<\/div>/i", $text, $lakes)) {
     foreach ($lakes[0] as $lake) {
@@ -219,14 +224,18 @@ function fish_report_parse_lake($text) {
  *
  * Processes individual reports.
  *
+ * @param int $nid
+ *   Node id for overall report.
  * @param string $text
  *   Raw report HTML text.
+  * @param int $date
+ *   Date of report.
  */
-function fish_report_parse_individual($text) {
+function fish_report_parse_individual($nid, $text, $date) {
   // Each report is a paragraph. Get all html removed, then parse by line.
   $filtered_data = array();
   $all_reports = array();
-  $lakes = fish_report_parse_build_lakes();
+  $lakes = fish_report_parse_build_term_data('lake');
   $text = fish_report_parse_clean($text);
   preg_match("/<div class=\"e2ma-layout-wrap\">(.*?)<\/div><\/span><\/td>/si", $text, $filtered_data);
   if (empty($filtered_data)) {
@@ -250,17 +259,57 @@ function fish_report_parse_individual($text) {
       }
       else {
         if (!empty($current_lake_tid)) {
-          $fishing = fish_report_parse_process_fish($report);
-          $reports_to_save[$current_lake_tid][] = array(
-            'lake' => $current_lake_name,
-            'report' => $report,
-            'fishing' => $fishing,
-          );
+          $report_date = array();
+          $save = TRUE;
+          if (preg_match('/\(Updated (on |)(.*?)\)/i', $report, $report_date)) {
+            $report_date[2] = str_replace('-', '/', $report_date[2]);
+            if (strtotime($report_date[2]) >= ($date - (86400 * 6))) {
+              $save = TRUE;
+            }
+            else {
+              $save = FALSE;
+            }
+          }
+          if ($save === TRUE) {
+            $fishing = fish_report_parse_process_fish($report);
+            /*$reports_to_save[$current_lake_tid][] = array(
+              'lake' => $current_lake_name,
+              'report' => $report,
+              'fishing' => $fishing,
+            );*/
+            // Lake Report Text node save.
+            $node = new stdClass();
+            $node->title = $current_lake_name . ' fishing report for ' . date('Y-m-d', $date);
+            $node->type = 'report';
+            node_object_prepare($node);
+            $node->language = LANGUAGE_NONE;
+            $node->uid = 1;
+            $node->body[$node->language][0]['value'] = $report;
+            $node->field_date[$node->language][]['value'] = $date;
+            $node->field_weekly_from[$node->language][]['target_id'] = $nid;
+            node_save($node);
+            $report_nid = $node->nid;
+            foreach ($fishing as $fish_and_condition) {
+              // Fishing Report node save.
+              $node = new stdClass();
+              $node->title = $fish_and_condition['fish_name'] . ' report for ' . $current_lake_name . ' on ' . date('Y-m-d', $date);
+              $node->type = 'fishing_report';
+              node_object_prepare($node);
+              $node->language = LANGUAGE_NONE;
+              $node->uid = 1;
+              $node->field_date[$node->language][]['value'] = $date;
+              $node->field_fish[$node->language][]['tid'] = $fish_and_condition['fish'];
+              $node->field_lake[$node->language][]['tid'] = $current_lake_tid;
+              $node->field_condition[$node->language][]['tid'] = $fish_and_condition['condition'];
+              $node->field_from_report[$node->language][]['target_id'] = $report_nid;
+              node_save($node);
+            }
+          }
         }
       }
     }
   }
-  dpm($reports_to_save);
+  //dpm($reports_to_save);
 }
 
 /**
@@ -275,14 +324,24 @@ function fish_report_parse_individual($text) {
  *   Cleans string.
  */
 function fish_report_parse_process_fish($report) {
-  $fishes = fish_report_parse_build_fishes();
-  $conditions = fish_report_parse_build_conditions();
+  $fishes = fish_report_parse_build_term_data('fish_type');
+  $conditions = fish_report_parse_build_term_data('condition');
   $fishing_report = array();
-  foreach ($fishes as $fish) {
+  foreach ($fishes as $fish_tid => $fish) {
     if (stripos($report, $fish) !== FALSE) {
-      foreach ($conditions as $condition) {
-        if (preg_match("/" . $fish . "(ing|)( fishing| reports|) (are|is|have\sbeen)(\sbiting|\sdone|)(\sfairly|\svery|) " . $condition . "(\s|\.)/i", $report)) {
-          $fishing_report[] = $fish . ' is ' . $condition;
+      foreach ($conditions as $condition_tid => $condition) {
+        if (stripos($report, $condition) !== FALSE) {
+          if (preg_match("/" . $fish . "(ing|)( fishing| reports|) (are|is|have\sbeen)(\sbiting|\sdone|)(\sfairly|\svery|) " . $condition . "(\s|\.)/i", $report)) {
+            $fishing_report[] = array(
+              'fish' => $fish_tid,
+              'fish_name' => $fish,
+              'condition' =>$condition_tid,
+              'condition_name' =>$condition,
+            );
+            // Bait: 
+            // "on (wax worms) and (Power Bait) as well as (nightcrawlers)."
+            break;
+          }
         }
       }
     }
@@ -307,63 +366,35 @@ function fish_report_parse_clean($text) {
 }
 
 /**
- * Builds taxonomy lakes and stores in memory.
- *
- * @return array
- *   Array of lakes.
- */
-function fish_report_parse_build_lakes() {
-  $lakes = drupal_static(__FUNCTION__);
-  if (!isset($lakes)) {
-    $vocabulary = taxonomy_vocabulary_machine_name_load('Lake');
-    $terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
-    foreach ($terms as $term) {
-      $lakes[$term->tid] = $term->name;
-    }
-  }
-  return $lakes;
-}
-
-/**
- * Builds taxonomy fishes and stores in memory.
- *
- * @return array
- *   Array of fishes.
- */
-function fish_report_parse_build_fishes() {
-  $fish = drupal_static(__FUNCTION__);
-  if (!isset($fish)) {
-    $vocabulary = taxonomy_vocabulary_machine_name_load('fish_type');
-    $terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
-    foreach ($terms as $term) {
-      $fish[$term->tid] = $term->name;
-      // @Todo: how would you Drupalize this so it's in the CMS? Parent/child and only use children?
-      /*if($term->name == 'bream') {
-        $fish[$term->tid]= 'bluegill';
-        $fish[$term->tid] = 'readear';
-        $fish[$term->tid] = 'redear';
-      }*/
-    }
-  }
-  return $fish;
-}
-
-/**
  * Builds taxonomy conditions and stores in memory.
  *
  * @return array
  *   Array of conditions.
  */
-function fish_report_parse_build_conditions() {
-  $conditions = drupal_static(__FUNCTION__);
-  if (!isset($conditions)) {
-    $vocabulary = taxonomy_vocabulary_machine_name_load('condition');
-    $terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
-    foreach ($terms as $term) {
-      $conditions[$term->tid] = $term->name;
+function fish_report_parse_build_term_data($vocab_name) {
+  $$vocab_name = drupal_static(__FUNCTION__);
+  if (!isset($$vocab_name)) {
+    $vid = db_select('taxonomy_vocabulary', 'tv')
+      ->fields('tv', array('vid'))
+      ->condition('machine_name', $vocab_name)
+      ->execute()
+      ->fetchColumn();
+    $options = array();
+    if ($vid) {
+      $tid = db_select('taxonomy_term_data', 'ttd')
+        ->fields('ttd',  array('tid', 'name'))
+        ->condition('vid', $vid)
+        ->orderBy('weight', 'ASC')
+        ->execute()
+        ->fetchAllKeyed();
+      if ($tid) {
+        foreach ($tid as $term_tid => $term_name) {
+          ${$vocab_name}[$term_tid] = $term_name;
+        }
+      }
     }
   }
-  return $conditions;
+  return $$vocab_name;
 }
 
 /**
