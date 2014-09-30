@@ -4,6 +4,8 @@
  * Code for Fish Report Parser module.
  */
 
+// @todo: featurize content types
+// @todo: change to drupal form so can submit approval of changes.
 // @todo: when a original_report is marked unparsed, all reports from it need to be deleted.
 
 /**
@@ -17,6 +19,18 @@ function fish_report_parse_menu() {
     'access arguments' => array('access content'),
     'type' => MENU_NORMAL_ITEM
   );
+  $items['parse/weeks'] = array(
+    'title' => 'Fishing Reports Parser - Raw Reports',
+    'page callback' => 'fish_report_parse_parse',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM
+  );
+  $items['parse/reports'] = array(
+    'title' => 'Fishing Reports Parser - Individual Reports',
+    'page callback' => 'fish_report_parse_reports',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM
+  );
   return $items;
 }
 
@@ -25,8 +39,7 @@ function fish_report_parse_menu() {
  */
 function fish_report_parse_display() {
   fish_report_parse_parse();
-  //fish_report_parse_reports();
-  // Should we do fish/condition parsing here, or in parse_reports?
+  fish_report_parse_reports(); // -- this needs to be a form, and on submit the parent nid is marked 'parsed';
   return 'parsed';
 }
 
@@ -51,7 +64,6 @@ function fish_report_parse_parse() {
   $raw_reports = array();
   $pattern = '/href=\"(.*?)\" target=\"\_blank\">(.*?fishing report.*?)<\/a><\/td><td class=\"tableCell\" style=\"width\: .*?px\">WEB/i';
   preg_match_all($pattern, $raw_html, $raw_reports);
-  $i = 0;
   foreach ($raw_reports[2] as $index => $title_string) {
     $title = $raw_reports[2][$index];
     $report_date = fish_report_parse_clean_date($raw_reports[2][$index]);
@@ -64,9 +76,7 @@ function fish_report_parse_parse() {
       'mod_date' => date("Y-m-d H:i:s", $unix_time),
       'unix' => $unix_time,
     );
-    //if ($i++ < 25) {
-      fish_report_parse_create_report($tmp);
-    //}
+    fish_report_parse_create_report($tmp);
   }
 }
 
@@ -81,7 +91,6 @@ function fish_report_parse_parse() {
 function fish_report_parse_create_report($data) {
   $report = '';
   if ($individual_reports_cache = cache_get('report-' . $data['unix'])) {
-    dpm($data['title'] . ' already in cache, skipping http pull. Getting text from cache.');
     // Fix for bad data.
     $report = $individual_reports_cache->data;
     if ($individual_reports_cache->data == '404') {
@@ -90,7 +99,6 @@ function fish_report_parse_create_report($data) {
     }
   }
   else {
-    dpm('Getting ' . $data['title']);
     $individual_report_request = drupal_http_request($data['url']);
     if (!isset($individual_report_request->error)) {
       $report = $individual_report_request->data;
@@ -101,17 +109,29 @@ function fish_report_parse_create_report($data) {
       $report = 'error';
     }
   }
-
-  $node = new stdClass();
-  $node->title = $data['title'];
-  $node->type = 'original_report';
-  node_object_prepare($node);
-  $node->language = LANGUAGE_NONE;
-  $node->uid = 1;
-  $node->body[$node->language][0]['value'] = $report;
-  $node->field_date[$node->language][]['value'] = $data['unix'];
-  $node->field_url[$node->language][]['url'] = $data['url'];
-  node_save($node);
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'original_report')
+    ->propertyCondition('status', 1)
+    ->range(0, 1)
+    ->propertyCondition('title', $data['title'], '=')
+    ->addMetaData('account', user_load(1));
+  $result = $query->execute();
+  if (!isset($result['node'])) {
+    $node = new stdClass();
+    $node->title = $data['title'];
+    $node->type = 'original_report';
+    node_object_prepare($node);
+    $node->language = LANGUAGE_NONE;
+    $node->uid = 1;
+    $node->body[$node->language][0]['value'] = $report;
+    $node->field_date[$node->language][]['value'] = $data['unix'];
+    $node->field_url[$node->language][]['url'] = $data['url'];
+    node_save($node);
+  }
+  else {
+    dpm('Report ' . $data['title'] . ' exists. Skipping.');
+  }
 }
 
 /**
@@ -149,6 +169,7 @@ function fish_report_parse_reports() {
     ->entityCondition('bundle', 'original_report')
     ->propertyCondition('status', 1)
     ->fieldCondition('field_parsed', 'value', '0', '=')
+    ->range(0, 25)
     ->addMetaData('account', user_load(1));
   $result = $query->execute();
   // This could be slow - we just need the body text and nid, not the whole node.
@@ -162,6 +183,8 @@ function fish_report_parse_reports() {
     $body = field_get_items('node', $node, 'body');
     $date = field_get_items('node', $node, 'field_date');
     fish_report_parse_individual($node->nid, $body[0]['value'], $date[0]['value']);
+    $node->field_parsed[LANGUAGE_NONE][0]['value'] = 1;
+    node_save($node);
   }
 }
 
@@ -272,11 +295,11 @@ function fish_report_parse_individual($nid, $text, $date) {
           }
           if ($save === TRUE) {
             $fishing = fish_report_parse_process_fish($report);
-            /*$reports_to_save[$current_lake_tid][] = array(
+            $reports_to_save[$current_lake_tid][] = array(
               'lake' => $current_lake_name,
               'report' => $report,
               'fishing' => $fishing,
-            );*/
+            );
             // Lake Report Text node save.
             $node = new stdClass();
             $node->title = $current_lake_name . ' fishing report for ' . date('Y-m-d', $date);
@@ -309,7 +332,7 @@ function fish_report_parse_individual($nid, $text, $date) {
       }
     }
   }
-  //dpm($reports_to_save);
+  dpm($reports_to_save);
 }
 
 /**
