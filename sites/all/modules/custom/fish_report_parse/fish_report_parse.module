@@ -2,18 +2,31 @@
 /**
  * @file
  * Code for Fish Report Parser module.
+ *
+ * Process:
+ * Reports come in a big weekly email. That email is cleaned up, then ran through
+ * a regex to group them by lake heading (multiple reports under one lake).
+ * Then those groups are sent to an individual parser to get condition and fish
+ * and saved by hash.
+ *
+ * /parse gets new weekly reports (throttled) and runs them through a lake filter
+ * then saves those lakes (if new ones), then sends individual reports to be scored
+ * and a form for saving.
  */
 
 variable_set('fish_throttle', 10);
 
 //drush -l fishing.dev -v eval 'foreach(taxonomy_get_tree(4) as $term) { taxonomy_term_delete($term->tid); }'
 
-// @todo: featurize content types
 // @todo: change to drupal form so can submit approval of changes.
 // @todo: when a original_report is marked unparsed, all reports from it need to be deleted.
-
 // @todo: fish_report_parse_display should display X at a time, and let you select what to save, or not save.
+// @todo: fish_report_parse_lakes_form and fish should prompt to save the feature with new values
+// @todo: turn this into a drush script -- can it?
 
+
+
+// Nothing but 'parse' is used right now.
 /**
  * Implements hook_menu().
  */
@@ -25,6 +38,7 @@ function fish_report_parse_menu() {
     'access arguments' => array('access content'),
     'type' => MENU_NORMAL_ITEM,
   );
+  // Gets the weekly reports only. Doesn't allow saving of individual ones.
   $items['parse/weeks'] = array(
     'title' => 'Fishing Reports Parser - Raw Reports',
     'page callback' => 'fish_report_parse_display_raw_reports',
@@ -65,15 +79,18 @@ function fish_report_parse_display() {
     dpm("looking at report " . $node->title);
     $body = field_get_items('node', $node, 'body');
     $date = field_get_items('node', $node, 'field_date');
+    // We only want to parse when the user selects it, this will do it automatically.
     //fish_report_parse_individual($node->nid, $body[0]['value'], $date[0]['value']);
     $reports[] = array(
       'body' => $body[0]['value'],
       'date' => $date[0]['value'],
-      'nid' => $node->nid, // do we need this?
+      'nid' => $node->nid,
+      'title' => $node->title,
     );
   }
 
   $output = array();
+  // Lakes form will only show when there are new lakes.
   $output = drupal_get_form('fish_report_parse_lakes_form', $reports);
   $output += drupal_get_form('fish_report_parse_reports_form', $reports);
   return $output;
@@ -159,29 +176,46 @@ function fish_report_parse_lake_callback($form, $form_state) {
  *   Form api.
  */
 function fish_report_parse_reports_form($form, &$form_state, $reports) {
+  // @todo: foreach here indicates multiple weekly reports could be passed in. How
+  // is this handled if it's more than one week?
+  dpm($reports);
   foreach ($reports as $report) {
+    // Is there an argument to be made to not do this logic here?
+    // $reports is a group of lake reports (1 thru n), maybe that should be passed in instead?
     // This saves each lake's report in cache with a hash uid.
     $lake_reports = fish_report_parse_individual($report['nid'], $report['body'], $report['date'], FALSE);
-  }
-  dpm($lake_reports);
-  if (!empty($lake_reports)) {
-    $form['reports'] = array(
-      '#type' => 'fieldset',
-      '#title' => 'Select Report(s) to Save',
-      '#collapsible' => TRUE,
-      '#collapsed' => FALSE,
-    );
-    $form['reports']['selected_report'] = array(
-      '#title' => 'Reports',
-      '#type' => 'checkboxes',
-      '#prefix' => '<div id="fish-report-reports-wrapper">',
-      '#suffix' => '</div>',
-      '#options' => $lake_reports,
-      '#ajax' => array(
-        'callback' => 'fish_report_parse_reports_callback',
-        'wrapper' => 'fish-report-reports-wrapper',
-      ),
-    );
+    dpm($lake_reports);
+    if (!empty($lake_reports)) {
+      $form['reports'][$report['nid']] = array(
+        '#type' => 'fieldset',
+        '#title' => $report['title'],
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE,
+      );
+      foreach ($lake_reports as $lake_tid => $lakes) {
+        // Data about individual reports is in $lakes['data']
+        $form['reports'][$report['nid']][$lake_tid] = array(
+          '#type' => 'fieldset',
+          '#title' => $lakes['lake_name'],
+          '#collapsible' => TRUE,
+          '#collapsed' => FALSE,
+        );
+        // @todo: this needs to check for previously saved hashes.
+        // @todo: display fish/condition report.
+        // @todo: add a 'delete' function to remove from future processing (strikethru)
+        $form['reports'][$report['nid']][$lake_tid]['selected_report'] = array(
+          '#title' => '',
+          '#type' => 'checkboxes',
+          '#prefix' => '<div id="fish-report-reports-wrapper">',
+          '#suffix' => '</div>',
+          '#options' => $lakes['hashes'],
+          '#ajax' => array(
+            'callback' => 'fish_report_parse_reports_callback',
+            'wrapper' => 'fish-report-reports-wrapper',
+          ),
+        );
+      }
+    }
   }
   return $form;
 }
@@ -193,6 +227,8 @@ function fish_report_parse_reports_callback($form, $form_state) {
   return $form['reports']['selected_report'];
 }
 
+// Below here a mixture of old and new saving functions. Save == true indicates
+// it was adapted from an old automatic process.
 
 
 
@@ -449,7 +485,9 @@ function fish_report_save_lake($term) {
 /**
  * Process Individual.
  *
- * Processes individual reports.
+ * This takes a set of reports from a lake (there can be multiple reports/paragraphs
+ * per lake) and breaks them down into individual reports, scored by fish and
+ * saved in hash.
  *
  * @param int $nid
  *   Node id for overall report.
@@ -481,7 +519,7 @@ function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
   $all_reports = array_filter($all_reports);
   $current_lake_tid = '';
   $current_lake_name = '';
-  $report_to_return = array();
+  $reports_to_return = array();
   foreach ($all_reports as $report) {
     $report = trim(strip_tags($report));
     if (!empty($report)) {
@@ -517,8 +555,18 @@ function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
               fish_report_save_report($new_report);
             }
             else {
-              $reports_to_return[$hash] = $new_report['lake'] . ' fishing report for ' . date('Y-m-d', $new_report['date']);
-              dpm($new_report);
+              // @todo: is there a better way to do this?
+              // This groups reports by lake.
+              if (!array_key_exists($current_lake_tid, $reports_to_return)) {
+                $reports_to_return[$current_lake_tid] = array();
+                $reports_to_return[$current_lake_tid]['hashes'] = array();
+                $reports_to_return[$current_lake_tid]['data'] = array();
+                $reports_to_return[$current_lake_tid]['lake_name'] = $current_lake_name;
+              }
+              $reports_to_return[$current_lake_tid]['data'][$hash] = $new_report;
+              // This is for the form ajax.
+              $reports_to_return[$current_lake_tid]['hashes'][$hash] = $new_report['report'];
+              // Save the report object to cache by hash.
               if (!($cache = cache_get('report - ' . $hash))) {
                 cache_set('report - ' . $hash, $new_report, 'cache');
               }
