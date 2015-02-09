@@ -44,7 +44,8 @@ function fish_report_parse_menu() {
  * Display function for parser menu callback.
  */
 function fish_report_parse_display() {
-  fish_report_get_reports();
+  // Comment/uncomment to get new Weekly Reports throttled (10)
+  //fish_report_get_reports();
 
   $reports = array();
   $query = new EntityFieldQuery();
@@ -159,6 +160,7 @@ function fish_report_parse_lake_callback($form, $form_state) {
  */
 function fish_report_parse_reports_form($form, &$form_state, $reports) {
   foreach ($reports as $report) {
+    // This saves each lake's report in cache with a hash uid.
     $lake_reports = fish_report_parse_individual($report['nid'], $report['body'], $report['date'], FALSE);
   }
   dpm($lake_reports);
@@ -516,6 +518,7 @@ function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
             }
             else {
               $reports_to_return[$hash] = $new_report['lake'] . ' fishing report for ' . date('Y-m-d', $new_report['date']);
+              dpm($new_report);
               if (!($cache = cache_get('report - ' . $hash))) {
                 cache_set('report - ' . $hash, $new_report, 'cache');
               }
