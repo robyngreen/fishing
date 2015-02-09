@@ -49,7 +49,7 @@ function fish_report_parse_display() {
   $reports = array();
   $query = new EntityFieldQuery();
   $query->entityCondition('entity_type', 'node')
-    ->entityCondition('bundle', 'original_report')
+    ->entityCondition('bundle', 'weekly_report')
     ->propertyCondition('status', 1)
     ->fieldCondition('field_parsed', 'value', '0', '=')
     ->range(0, 1)
@@ -255,7 +255,7 @@ function fish_report_get_reports($get_new = FALSE) {
     $title = $raw_reports[2][$index];
     $query = new EntityFieldQuery();
     $query->entityCondition('entity_type', 'node')
-      ->entityCondition('bundle', 'original_report')
+      ->entityCondition('bundle', 'weekly_report')
       ->propertyCondition('status', 1)
       ->range(0, 1)
       ->propertyCondition('title', $title, '=')
@@ -309,7 +309,7 @@ function fish_report_parse_create_report($data) {
   }
   $node = new stdClass();
   $node->title = $data['title'];
-  $node->type = 'original_report';
+  $node->type = 'weekly_report';
   node_object_prepare($node);
   $node->language = LANGUAGE_NONE;
   $node->uid = 1;
