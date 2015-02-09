@@ -593,7 +593,7 @@ function fish_report_parse_process_fish($report) {
               'condition' =>$condition_tid,
               'condition_name' =>$condition,
             );
-            // Bait: 
+            // Bait:
             // "on (wax worms) and (Power Bait) as well as (nightcrawlers)."
             break;
           }
