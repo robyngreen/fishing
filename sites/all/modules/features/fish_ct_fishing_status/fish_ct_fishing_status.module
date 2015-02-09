@@ -1,0 +1,7 @@
+<?php
+/**
+ * @file
+ * Code for the Fishing Status feature.
+ */
+
+include_once 'fish_ct_fishing_status.features.inc';
