@@ -23,19 +23,19 @@ function fish_report_parse_menu() {
     'title' => 'Fishing Reports Parser',
     'page callback' => 'fish_report_parse_display',
     'access arguments' => array('access content'),
-    'type' => MENU_NORMAL_ITEM
+    'type' => MENU_NORMAL_ITEM,
   );
   $items['parse/weeks'] = array(
     'title' => 'Fishing Reports Parser - Raw Reports',
     'page callback' => 'fish_report_parse_display_raw_reports',
     'access arguments' => array('access content'),
-    'type' => MENU_NORMAL_ITEM
+    'type' => MENU_NORMAL_ITEM,
   );
   $items['parse/reports'] = array(
     'title' => 'Fishing Reports Parser - Individual Reports',
     'page callback' => 'fish_report_parse_display_reports',
     'access arguments' => array('access content'),
-    'type' => MENU_NORMAL_ITEM
+    'type' => MENU_NORMAL_ITEM,
   );
   return $items;
 }
@@ -44,9 +44,7 @@ function fish_report_parse_menu() {
  * Display function for parser menu callback.
  */
 function fish_report_parse_display() {
-  fish_report_parse_parse();
-  //fish_report_parse_reports(); // -- this needs to be a form, and on submit the parent nid is marked 'parsed';
-  $output = '';
+  fish_report_get_reports();
 
   $reports = array();
   $query = new EntityFieldQuery();
@@ -64,29 +62,30 @@ function fish_report_parse_display() {
   }
   foreach ($report_items as $node) {
     dpm("looking at report " . $node->title);
-    //fish_report_parse_lake($node->body[LANGUAGE_NONE][0]['value']);
     $body = field_get_items('node', $node, 'body');
     $date = field_get_items('node', $node, 'field_date');
     //fish_report_parse_individual($node->nid, $body[0]['value'], $date[0]['value']);
     $reports[] = array(
       'body' => $body[0]['value'],
       'date' => $date[0]['value'],
-      'nid' => $node->nid, 
+      'nid' => $node->nid, // do we need this?
     );
   }
 
+  $output = array();
   $output = drupal_get_form('fish_report_parse_lakes_form', $reports);
+  $output += drupal_get_form('fish_report_parse_reports_form', $reports);
   return $output;
 }
 
 /**
- * Lake hook.
+ * Lake Form hook.
  *
  * @param string $form
  *   fapi form.
  * @param string $form_state
  *   fapi form state values.
-  * @param array $reports
+ * @param array $reports
  *   Text of reports.
  *
  * @return string
@@ -94,36 +93,121 @@ function fish_report_parse_display() {
  */
 function fish_report_parse_lakes_form($form, &$form_state, $reports) {
   $lake_options = array();
-  foreach ($reports as $report) {
-    $lakes = fish_report_parse_lake($report['body'], FALSE);
-    foreach ($lakes as $lake) {
-      $lake_options[] = $lake;
+
+  if (empty($form_state['values']['selected_lake'])) {
+    foreach ($reports as $report) {
+      $lakes = fish_report_parse_lake($report['body'], FALSE);
+      foreach ($lakes as $lake) {
+        $lake_options[] = $lake;
+      }
     }
   }
-  $form['lakes'] = array(
-    '#title' => 'Select Lake(s) to Save',
-    '#type' => 'checkboxes',
-    '#options' => drupal_map_assoc($lake_options),
-    '#ajax' => array(
-      'callback' => 'fish_report_parse_lake_callback',
-      'wrapper' => 'fish-report-lake-wrapper',
-    ),
-  );
+  else {
+    foreach ($form_state['values']['selected_lake'] as $lake => $selected) {
+      if ($selected === 0) {
+        $lake_options[] = $lake;
+      }
+      else {
+        if ($cache = cache_get('lake - ' . $lake)) {
+          fish_report_save_lake($cache->data);
+        }
+      }
+    }
+  }
+
+  if (!empty($lake_options)) {
+    $form['lakes'] = array(
+      '#type' => 'fieldset',
+      '#title' => 'Select Lake(s) to Save',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+    );
+    $form['lakes']['selected_lake'] = array(
+      '#title' => 'Lakes',
+      '#type' => 'checkboxes',
+      '#prefix' => '<div id="fish-report-lake-wrapper">',
+      '#suffix' => '</div>',
+      '#options' => drupal_map_assoc($lake_options),
+      '#ajax' => array(
+        'callback' => 'fish_report_parse_lake_callback',
+        'wrapper' => 'fish-report-lake-wrapper',
+      ),
+    );
+  }
+  return $form;
+}
+
+/**
+ * Lake form callback.
+ */
+function fish_report_parse_lake_callback($form, $form_state) {
+  return $form['lakes']['selected_lake'];
+}
+
+/**
+ * Reports Form hook.
+ *
+ * @param string $form
+ *   fapi form.
+ * @param string $form_state
+ *   fapi form state values.
+ * @param array $reports
+ *   Text of reports.
+ *
+ * @return string
+ *   Form api.
+ */
+function fish_report_parse_reports_form($form, &$form_state, $reports) {
+  foreach ($reports as $report) {
+    $lake_reports = fish_report_parse_individual($report['nid'], $report['body'], $report['date'], FALSE);
+  }
+  dpm($lake_reports);
+  if (!empty($lake_reports)) {
+    $form['reports'] = array(
+      '#type' => 'fieldset',
+      '#title' => 'Select Report(s) to Save',
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+    );
+    $form['reports']['selected_report'] = array(
+      '#title' => 'Reports',
+      '#type' => 'checkboxes',
+      '#prefix' => '<div id="fish-report-reports-wrapper">',
+      '#suffix' => '</div>',
+      '#options' => $lake_reports,
+      '#ajax' => array(
+        'callback' => 'fish_report_parse_reports_callback',
+        'wrapper' => 'fish-report-reports-wrapper',
+      ),
+    );
+  }
   return $form;
 }
 
 /**
  * Weekly Reports form callback.
  */
-function fish_report_parse_lake_callback($form, $form_state) {
-  return $form['results'];
+function fish_report_parse_reports_callback($form, $form_state) {
+  return $form['reports']['selected_report'];
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 /**
  * Display function for parser menu callback.
  */
 function fish_report_parse_display_raw_reports() {
-  fish_report_parse_parse();
+  fish_report_get_reports();
   return 'parsed';
 }
 
@@ -131,7 +215,7 @@ function fish_report_parse_display_raw_reports() {
  * Display function for parser menu callback.
  */
 function fish_report_parse_display_reports() {
-  fish_report_parse_reports();
+  //fish_report_parse_reports();
   return 'parsed';
 }
 
@@ -141,7 +225,7 @@ function fish_report_parse_display_reports() {
  * @param bool $get_new
  *   Whether to get new reports or not.
  */
-function fish_report_parse_parse($get_new = FALSE) {
+function fish_report_get_reports($get_new = FALSE) {
   $throttle = variable_get('fish_throttle', 10);
   $raw_html = drupal_static(__FUNCTION__);
   $reports_url = 'http://www.agfc.com/fishing/Pages/FishingReports.aspx';
@@ -195,7 +279,7 @@ function fish_report_parse_parse($get_new = FALSE) {
 }
 
 /**
- * Create Report
+ * Create Report.
  *
  * Creates original_report node.
  *
@@ -262,42 +346,17 @@ function fish_report_parse_clean_date($raw_date) {
 }
 
 /**
- * Loops through unparsed original nodes and creates reports.
- */
-function fish_report_parse_reports($save = TRUE) {
-  $query = new EntityFieldQuery();
-  $query->entityCondition('entity_type', 'node')
-    ->entityCondition('bundle', 'original_report')
-    ->propertyCondition('status', 1)
-    ->fieldCondition('field_parsed', 'value', '0', '=')
-    ->range(0, 1)
-    ->addMetaData('account', user_load(1));
-  $result = $query->execute();
-  // This could be slow - we just need the body text and nid, not the whole node.
-  if (isset($result['node'])) {
-    $report_item_nids = array_keys($result['node']);
-    $report_items = entity_load('node', $report_item_nids);
-  }
-  foreach ($report_items as $node) {
-    dpm("Report (" . $node->title . ') ' . $node->field_url[LANGUAGE_NONE][0]['url']);
-    fish_report_parse_lake($node->body[LANGUAGE_NONE][0]['value']);
-    $body = field_get_items('node', $node, 'body');
-    $date = field_get_items('node', $node, 'field_date');
-    fish_report_parse_individual($node->nid, $body[0]['value'], $date[0]['value']);
-    $node->field_parsed[LANGUAGE_NONE][0]['value'] = 1;
-    if ($save === TRUE) {
-      node_save($node);
-    }
-  }
-}
-
-/**
  * Process Lake.
  *
  * Extracts lakes from body of report.
  *
  * @param string $text
  *   Raw report HTML text.
+ * @param bool $save
+ *   Save or return.
+ *
+ * @return array
+ *   Array of reports.
  */
 function fish_report_parse_lake($text, $save = TRUE) {
   $seen_lakes = fish_report_parse_build_term_data('lake');
@@ -329,27 +388,19 @@ function fish_report_parse_lake($text, $save = TRUE) {
               $term = new stdClass();
               $term->name = $raw_lake;
               $term->vid = $vid;
-              /*if (preg_match("/href=('|\")(.*?)('|\")/",$sublake[0][0], $link)) {
+              if (preg_match("/href=('|\")(.*?)('|\")/",$sublake[0][0], $link)) {
                 $link[2] = trim($link[2]);
-                $request = drupal_http_request($link[2]);
-                if (!isset($request->error)) {
-                  $raw_html = $request->data;
-                  if (preg_match("/<div id=\"lat.*?display\: none;\">(.*?)<\/div></si",$raw_html,$lat)
-                      && preg_match("/<div id=\"long.*?display\: none;\">(.*?)<\/div>/si",$raw_html,$lon)) {
-                    $term->field_location[LANGUAGE_NONE][] = array(
-                      'lat' => $lat[1],
-                      'lon' => $lon[1],
-                    );
-                  }
-                }
-              }*/
-             if ($save === TRUE) {
-                taxonomy_term_save($term);
+                $term->link = $link[2];
+              }
+              if ($save === TRUE) {
+                $term = fish_report_save_lake($term);
                 $seen_lakes[$term->tid] = $raw_lake;
               }
               else {
                 $lakes_to_return[] = $raw_lake;
-                // store it in cache here.
+                if (!($cache = cache_get('lake - ' . $raw_lake))) {
+                  cache_set('lake - ' . $raw_lake, $term, 'cache');
+                }
                 $seen_lakes[$raw_lake] = $raw_lake;
               }
             }
@@ -364,6 +415,36 @@ function fish_report_parse_lake($text, $save = TRUE) {
 }
 
 /**
+ * Save Lake.
+ *
+ * Saves Lake term.
+ *
+ * @param object $term
+ *   Term object for lake.
+ *
+ * @return object
+ *   Term object.
+ */
+function fish_report_save_lake($term) {
+  if (!empty($term->link)) {
+    $request = drupal_http_request($term->link);
+    if (!isset($request->error)) {
+      $raw_html = $request->data;
+      if (preg_match("/<div id=\"lat.*?display\: none;\">(.*?)<\/div></si",$raw_html,$lat)
+          && preg_match("/<div id=\"long.*?display\: none;\">(.*?)<\/div>/si",$raw_html,$lon)) {
+        $term->field_location[LANGUAGE_NONE][] = array(
+          'lat' => $lat[1],
+          'lon' => $lon[1],
+        );
+      }
+    }
+    unset($term->link);
+  }
+  taxonomy_term_save($term);
+  return $term;
+}
+
+/**
  * Process Individual.
  *
  * Processes individual reports.
@@ -372,10 +453,15 @@ function fish_report_parse_lake($text, $save = TRUE) {
  *   Node id for overall report.
  * @param string $text
  *   Raw report HTML text.
-  * @param int $date
+ * @param int $date
  *   Date of report.
+ * @param bool $save
+ *   Save report.
+ *
+ * @return array
+ *   Array of reports
  */
-function fish_report_parse_individual($nid, $text, $date) {
+function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
   // Each report is a paragraph. Get all html removed, then parse by line.
   $filtered_data = array();
   $all_reports = array();
@@ -393,7 +479,7 @@ function fish_report_parse_individual($nid, $text, $date) {
   $all_reports = array_filter($all_reports);
   $current_lake_tid = '';
   $current_lake_name = '';
-  $reports_to_save = array();
+  $report_to_return = array();
   foreach ($all_reports as $report) {
     $report = trim(strip_tags($report));
     if (!empty($report)) {
@@ -404,56 +490,81 @@ function fish_report_parse_individual($nid, $text, $date) {
       else {
         if (!empty($current_lake_tid)) {
           $report_date = array();
-          $save = TRUE;
+          $report_is_savable = TRUE;
           if (preg_match('/\(Updated (on |)(.*?)\)/i', $report, $report_date)) {
             $report_date[2] = str_replace('-', '/', $report_date[2]);
             if (strtotime($report_date[2]) >= ($date - (86400 * 6))) {
-              $save = TRUE;
+              $report_is_savable = TRUE;
             }
             else {
-              $save = FALSE;
+              $report_is_savable = FALSE;
             }
           }
-          if ($save === TRUE) {
+          if ($report_is_savable === TRUE) {
             $fishing = fish_report_parse_process_fish($report);
-            $reports_to_save[$current_lake_tid][] = array(
+            $hash = md5($report);
+            $new_report = array(
               'lake' => $current_lake_name,
+              'lake_tid' => $current_lake_tid,
               'report' => $report,
               'fishing' => $fishing,
+              'date' => $date,
+              'nid' => $nid,
             );
-            // Lake Report Text node save.
-            $node = new stdClass();
-            $node->title = $current_lake_name . ' fishing report for ' . date('Y-m-d', $date);
-            $node->type = 'report';
-            node_object_prepare($node);
-            $node->language = LANGUAGE_NONE;
-            $node->uid = 1;
-            $node->body[$node->language][0]['value'] = $report;
-            $node->field_date[$node->language][]['value'] = $date;
-            $node->field_weekly_from[$node->language][]['target_id'] = $nid;
-            node_save($node);
-            $report_nid = $node->nid;
-            foreach ($fishing as $fish_and_condition) {
-              // Fishing Report node save.
-              $node = new stdClass();
-              $node->title = $fish_and_condition['fish_name'] . ' report for ' . $current_lake_name . ' on ' . date('Y-m-d', $date);
-              $node->type = 'fishing_report';
-              node_object_prepare($node);
-              $node->language = LANGUAGE_NONE;
-              $node->uid = 1;
-              $node->field_date[$node->language][]['value'] = $date;
-              $node->field_fish[$node->language][]['tid'] = $fish_and_condition['fish'];
-              $node->field_lake[$node->language][]['tid'] = $current_lake_tid;
-              $node->field_condition[$node->language][]['tid'] = $fish_and_condition['condition'];
-              $node->field_from_report[$node->language][]['target_id'] = $report_nid;
-              node_save($node);
+            if ($save === TRUE) {
+              fish_report_save_report($new_report);
+            }
+            else {
+              $reports_to_return[$hash] = $new_report['lake'] . ' fishing report for ' . date('Y-m-d', $new_report['date']);
+              if (!($cache = cache_get('report - ' . $hash))) {
+                cache_set('report - ' . $hash, $new_report, 'cache');
+              }
             }
           }
         }
       }
     }
   }
-  dpm($reports_to_save);
+  if ($save === FALSE) {
+    return $reports_to_return;
+  }
+}
+
+/**
+ * Save Report.
+ *
+ * Saves individual reports.
+ *
+ * @param array $report
+ *   Indexed array of report to save.
+ */
+function fish_report_save_report($report) {
+  $node = new stdClass();
+  $node->title = $report['lake'] . ' fishing report for ' . date('Y-m-d', $report['date']);
+  $node->type = 'report';
+  node_object_prepare($node);
+  $node->language = LANGUAGE_NONE;
+  $node->uid = 1;
+  $node->body[$node->language][0]['value'] = $report['report'];
+  $node->field_date[$node->language][]['value'] = $report['date'];
+  $node->field_weekly_from[$node->language][]['target_id'] = $report['nid'];
+  node_save($node);
+  $report_nid = $node->nid;
+  foreach ($report['fishing'] as $fish_and_condition) {
+    // Fishing Report node save.
+    $node = new stdClass();
+    $node->title = $fish_and_condition['fish_name'] . ' report for ' . $report['lake'] . ' on ' . date('Y-m-d', $report['date']);
+    $node->type = 'fishing_report';
+    node_object_prepare($node);
+    $node->language = LANGUAGE_NONE;
+    $node->uid = 1;
+    $node->field_date[$node->language][]['value'] = $report['date'];
+    $node->field_fish[$node->language][]['tid'] = $fish_and_condition['fish'];
+    $node->field_lake[$node->language][]['tid'] = $report['lake_tid'];
+    $node->field_condition[$node->language][]['tid'] = $fish_and_condition['condition'];
+    $node->field_from_report[$node->language][]['target_id'] = $report_nid;
+    node_save($node);
+  }
 }
 
 /**
@@ -482,7 +593,7 @@ function fish_report_parse_process_fish($report) {
               'condition' =>$condition_tid,
               'condition_name' =>$condition,
             );
-            // Bait: 
+            // Bait:
             // "on (wax worms) and (Power Bait) as well as (nightcrawlers)."
             break;
           }
