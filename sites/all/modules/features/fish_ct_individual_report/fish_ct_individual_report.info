@@ -1,0 +1,17 @@
+name = Individual Report
+core = 7.x
+package = Fish
+version = 7.x-1.0
+project = fish_ct_individual_report
+dependencies[] = date
+dependencies[] = entityreference
+dependencies[] = features
+dependencies[] = text
+features[features_api][] = api:2
+features[field_base][] = body
+features[field_base][] = field_date
+features[field_base][] = field_weekly_from
+features[field_instance][] = node-individual_report-body
+features[field_instance][] = node-individual_report-field_date
+features[field_instance][] = node-individual_report-field_weekly_from
+features[node][] = individual_report

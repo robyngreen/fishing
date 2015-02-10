@@ -1,0 +1,733 @@
+<?php
+/**
+ * @file
+ * Code for Fish Report Parser module.
+ *
+ * Process:
+ * Reports come in a big weekly email. That email is cleaned up, then ran through
+ * a regex to group them by lake heading (multiple reports under one lake).
+ * Then those groups are sent to an individual parser to get condition and fish
+ * and saved by hash.
+ *
+ * /parse gets new weekly reports (throttled) and runs them through a lake filter
+ * then saves those lakes (if new ones), then sends individual reports to be scored
+ * and a form for saving.
+ */
+
+variable_set('fish_throttle', 10);
+
+//drush -l fishing.dev -v eval 'foreach(taxonomy_get_tree(4) as $term) { taxonomy_term_delete($term->tid); }'
+
+// @todo: change to drupal form so can submit approval of changes.
+// @todo: when a original_report is marked unparsed, all reports from it need to be deleted.
+// @todo: fish_report_parse_display should display X at a time, and let you select what to save, or not save.
+// @todo: fish_report_parse_lakes_form and fish should prompt to save the feature with new values
+// @todo: turn this into a drush script -- can it?
+
+
+
+// Nothing but 'parse' is used right now.
+/**
+ * Implements hook_menu().
+ */
+function fish_report_parse_menu() {
+  $items = array();
+  $items['parse'] = array(
+    'title' => 'Fishing Reports Parser',
+    'page callback' => 'fish_report_parse_display',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  // Gets the weekly reports only. Doesn't allow saving of individual ones.
+  $items['parse/weeks'] = array(
+    'title' => 'Fishing Reports Parser - Raw Reports',
+    'page callback' => 'fish_report_parse_display_raw_reports',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  $items['parse/reports'] = array(
+    'title' => 'Fishing Reports Parser - Individual Reports',
+    'page callback' => 'fish_report_parse_display_reports',
+    'access arguments' => array('access content'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  return $items;
+}
+
+/**
+ * Display function for parser menu callback.
+ */
+function fish_report_parse_display() {
+  // Comment/uncomment to get new Weekly Reports throttled (10)
+  //fish_report_get_reports();
+
+  $reports = array();
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'weekly_report')
+    ->propertyCondition('status', 1)
+    ->fieldCondition('field_parsed', 'value', '0', '=')
+    ->range(0, 1)
+    ->fieldOrderBy('field_date', 'value', 'DESC')
+    ->addMetaData('account', user_load(1));
+  $result = $query->execute();
+  if (isset($result['node'])) {
+    $report_item_nids = array_keys($result['node']);
+    $report_items = entity_load('node', $report_item_nids);
+  }
+  foreach ($report_items as $node) {
+    //dpm("looking at report " . $node->title);
+    $body = field_get_items('node', $node, 'body');
+    $date = field_get_items('node', $node, 'field_date');
+    // We only want to parse when the user selects it, this will do it automatically.
+    //fish_report_parse_individual($node->nid, $body[0]['value'], $date[0]['value']);
+    $reports[] = array(
+      'body' => $body[0]['value'],
+      'date' => $date[0]['value'],
+      'nid' => $node->nid,
+      'title' => $node->title,
+    );
+  }
+
+  $output = array();
+  // Lakes form will only show when there are new lakes.
+  $output = drupal_get_form('fish_report_parse_lakes_form', $reports);
+  $output += drupal_get_form('fish_report_parse_reports_form', $reports);
+  return $output;
+}
+
+/**
+ * Lake Form hook.
+ *
+ * @param string $form
+ *   fapi form.
+ * @param string $form_state
+ *   fapi form state values.
+ * @param array $reports
+ *   Text of reports.
+ *
+ * @return string
+ *   Form api.
+ */
+function fish_report_parse_lakes_form($form, &$form_state, $reports) {
+  $lake_options = array();
+
+  if (empty($form_state['values']['selected_lake'])) {
+    foreach ($reports as $report) {
+      $lakes = fish_report_parse_lake($report['body'], FALSE);
+      foreach ($lakes as $lake) {
+        $lake_options[] = $lake;
+      }
+    }
+  }
+  else {
+    foreach ($form_state['values']['selected_lake'] as $lake => $selected) {
+      if ($selected === 0) {
+        $lake_options[] = $lake;
+      }
+      else {
+        if ($cache = cache_get('lake - ' . $lake)) {
+          fish_report_save_lake($cache->data);
+        }
+      }
+    }
+  }
+
+  if (!empty($lake_options)) {
+    $form['lakes'] = array(
+      '#type' => 'fieldset',
+      '#title' => 'Select Lake(s) to Save',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+    );
+    $form['lakes']['selected_lake'] = array(
+      '#title' => 'Lakes',
+      '#type' => 'checkboxes',
+      '#prefix' => '<div id="fish-report-lake-wrapper">',
+      '#suffix' => '</div>',
+      '#options' => drupal_map_assoc($lake_options),
+      '#ajax' => array(
+        'callback' => 'fish_report_parse_lake_callback',
+        'wrapper' => 'fish-report-lake-wrapper',
+      ),
+    );
+  }
+  return $form;
+}
+
+/**
+ * Lake form callback.
+ */
+function fish_report_parse_lake_callback($form, $form_state) {
+  return $form['lakes']['selected_lake'];
+}
+
+/**
+ * Reports Form hook.
+ *
+ * @param string $form
+ *   fapi form.
+ * @param string $form_state
+ *   fapi form state values.
+ * @param array $reports
+ *   Text of reports.
+ *
+ * @return string
+ *   Form api.
+ */
+function fish_report_parse_reports_form($form, &$form_state, $reports) {
+  dpm('form builder');
+  // @todo: foreach here indicates multiple weekly reports could be passed in. How
+  // is this handled if it's more than one week?
+  foreach ($reports as $report) {
+    // Is there an argument to be made to not do this logic here?
+    // $reports is a group of lake reports (1 thru n), maybe that should be passed in instead?
+    // This saves each lake's report in cache with a hash uid.
+    // @todo: ajax callback could make this expensive. Move it.
+    $lake_reports = fish_report_parse_individual($report['nid'], $report['body'], $report['date'], FALSE);
+    if (!empty($lake_reports)) {
+      $form['reports'][$report['nid']] = array(
+        '#type' => 'fieldset',
+        '#title' => $report['title'],
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE,
+      );
+      foreach ($lake_reports as $lake_tid => $lakes) {
+        // Data about individual reports is in $lakes['data']
+        $form['reports'][$report['nid']][$lake_tid] = array(
+          '#type' => 'fieldset',
+          '#title' => $lakes['lake_name'],
+          '#collapsible' => TRUE,
+          '#collapsed' => FALSE,
+        );
+        // @todo: this needs to check for previously saved hashes.
+        // @todo: display fish/condition report.
+        // @todo: add a 'delete' function to remove from future processing (strikethru)
+        $form['reports'][$report['nid']][$lake_tid]['selected_report'] = array(
+          '#title' => '',
+          '#type' => 'checkboxes',
+          '#prefix' => '<div id="fish-report-reports-wrapper">',
+          '#suffix' => '</div>',
+          '#options' => $lakes['hashes'],
+          '#ajax' => array(
+            'callback' => 'fish_report_parse_reports_callback',
+            'wrapper' => 'fish-report-reports-wrapper',
+          ),
+        );
+      }
+    }
+  }
+  return $form;
+}
+
+/**
+ * Weekly Reports form callback.
+ */
+function fish_report_parse_reports_callback($form, $form_state) {
+  return $form['reports'];
+}
+
+// Below here a mixture of old and new saving functions. Save == true indicates
+// it was adapted from an old automatic process.
+
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * Display function for parser menu callback.
+ */
+function fish_report_parse_display_raw_reports() {
+  fish_report_get_reports();
+  return 'parsed';
+}
+
+/**
+ * Display function for parser menu callback.
+ */
+function fish_report_parse_display_reports() {
+  //fish_report_parse_reports();
+  return 'parsed';
+}
+
+/**
+ * Gets list of all reports from remote URL.
+ *
+ * @param bool $get_new
+ *   Whether to get new reports or not.
+ */
+function fish_report_get_reports($get_new = FALSE) {
+  $throttle = variable_get('fish_throttle', 10);
+  $raw_html = drupal_static(__FUNCTION__);
+  $reports_url = 'http://www.agfc.com/fishing/Pages/FishingReports.aspx';
+  if (!isset($raw_html)) {
+    if ($get_new !== TRUE && $cache = cache_get('fish_reports_html')) {
+      dpm('cache');
+      $raw_html = $cache->data;
+    }
+    else {
+      dpm('getting new');
+      $request = drupal_http_request($reports_url);
+      if (!isset($request->error)) {
+        $raw_html = $request->data;
+        cache_set('fish_reports_html', $raw_html, 'cache');
+      }
+    }
+  }
+
+  $raw_reports = array();
+  $pattern = '/href=\"(.*?)\" target=\"\_blank\">(.*?fishing report.*?)<\/a><\/td><td class=\"tableCell\" style=\"width\: .*?px\">WEB/i';
+  preg_match_all($pattern, $raw_html, $raw_reports);
+  $i = 0;
+  foreach ($raw_reports[2] as $index => $title_string) {
+    if ($i >= $throttle) {
+      break;
+    }
+    $title = $raw_reports[2][$index];
+    $query = new EntityFieldQuery();
+    $query->entityCondition('entity_type', 'node')
+      ->entityCondition('bundle', 'weekly_report')
+      ->propertyCondition('status', 1)
+      ->range(0, 1)
+      ->propertyCondition('title', $title, '=')
+      ->addMetaData('account', user_load(1));
+    $result = $query->execute();
+    if (!isset($result['node'])) {
+      $report_date = fish_report_parse_clean_date($raw_reports[2][$index]);
+      $unix_time = strtotime($report_date);
+      $url = $raw_reports[1][$index];
+      $tmp = array(
+        'title' => $title,
+        'url' => $url,
+        'orig_date' => $report_date,
+        'mod_date' => date("Y-m-d H:i:s", $unix_time),
+        'unix' => $unix_time,
+      );
+      fish_report_parse_create_report($tmp);
+      $i++;
+    }
+  }
+}
+
+/**
+ * Create Report.
+ *
+ * Creates original_report node.
+ *
+ * @param array $data
+ *   Keyed array of data used to build node.
+ */
+function fish_report_parse_create_report($data) {
+  $report = '';
+  if ($individual_reports_cache = cache_get('report-' . $data['unix'])) {
+    // Fix for bad data.
+    $report = $individual_reports_cache->data;
+    if ($individual_reports_cache->data == '404') {
+      cache_set('report-' . $data['unix'], 'error', 'cache');
+      $report = 'error';
+    }
+  }
+  else {
+    $individual_report_request = drupal_http_request($data['url']);
+    if (!isset($individual_report_request->error)) {
+      $report = $individual_report_request->data;
+      cache_set('report-' . $data['unix'], $individual_report_request->data, 'cache');
+    }
+    else {
+      cache_set('report-' . $data['unix'], 'error', 'cache');
+      $report = 'error';
+    }
+  }
+  $node = new stdClass();
+  $node->title = $data['title'];
+  $node->type = 'weekly_report';
+  node_object_prepare($node);
+  $node->language = LANGUAGE_NONE;
+  $node->uid = 1;
+  $node->body[$node->language][0]['value'] = $report;
+  $node->field_date[$node->language][]['value'] = $data['unix'];
+  $node->field_url[$node->language][]['url'] = $data['url'];
+  node_save($node);
+}
+
+/**
+ * Cleans Dates.
+ *
+ * Cleans data from AGF text.
+ *
+ * @param string $raw_date
+ *   Raw date from website.
+ *
+ * @return string
+ *   Cleaned date string.
+ */
+function fish_report_parse_clean_date($raw_date) {
+  // Remove Weekly | Fishing | report from string for date.
+  $words = array(
+    '/\bweekly\b/i',
+    '/\bfishing\b/i',
+    '/\breport\b/i',
+  );
+  $raw_date = preg_replace($words, '', $raw_date);
+  $raw_date = preg_replace('/[^A-Za-z0-9\s,]/', '', $raw_date);
+  $raw_date = trim($raw_date);
+  // Fix typo on ARGF site.
+  $raw_date = ($raw_date === 'March, 7, 2012') ? 'March 7, 2012' : $raw_date;
+  return $raw_date;
+}
+
+/**
+ * Process Lake.
+ *
+ * Extracts lakes from body of report.
+ *
+ * @param string $text
+ *   Raw report HTML text.
+ * @param bool $save
+ *   Save or return.
+ *
+ * @return array
+ *   Array of reports.
+ */
+function fish_report_parse_lake($text, $save = TRUE) {
+  $seen_lakes = fish_report_parse_build_term_data('lake');
+  $lakes_to_return = array();
+  $vid = db_select('taxonomy_vocabulary', 'tv')
+    ->fields('tv', array('vid'))
+    ->condition('machine_name', 'lake')
+    ->execute()
+    ->fetchColumn();
+  if ($vid) {
+    $lakes = array();
+    if (preg_match_all("/<.*?<strong>.*?<\/div>/i", $text, $lakes)) {
+      foreach ($lakes[0] as $lake) {
+        $sublake = array();
+        $raw_lake = '';
+        if (preg_match_all("/<.*?font-size\: 12pt;.*?<\/div>/i", $lake, $sublake)) {
+          $raw_lake = $sublake[0][0];
+        }
+        if (preg_match_all("/<.*?color: (#8f3c1e|rgb\(143, 60, 30\));.*?<\/div>/i", $lake, $sublake)) {
+          $raw_lake = $sublake[0][0];
+        }
+        if ($raw_lake != '') {
+          $raw_lake = strip_tags($raw_lake);
+          $raw_lake = fish_report_parse_clean($raw_lake);
+          $raw_lake = trim($raw_lake);
+          $raw_lake = ($raw_lake === 'Greers FerryLake') ? 'Greers Ferry Lake' : $raw_lake;
+          if (stripos($raw_lake, 'Just Fishing Guides') === FALSE) {
+            if (!in_array($raw_lake, $seen_lakes)) {
+              $term = new stdClass();
+              $term->name = $raw_lake;
+              $term->vid = $vid;
+              if (preg_match("/href=('|\")(.*?)('|\")/",$sublake[0][0], $link)) {
+                $link[2] = trim($link[2]);
+                $term->link = $link[2];
+              }
+              if ($save === TRUE) {
+                $term = fish_report_save_lake($term);
+                $seen_lakes[$term->tid] = $raw_lake;
+              }
+              else {
+                $lakes_to_return[] = $raw_lake;
+                if (!($cache = cache_get('lake - ' . $raw_lake))) {
+                  cache_set('lake - ' . $raw_lake, $term, 'cache');
+                }
+                $seen_lakes[$raw_lake] = $raw_lake;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if ($save === FALSE) {
+    return $lakes_to_return;
+  }
+}
+
+/**
+ * Save Lake.
+ *
+ * Saves Lake term.
+ *
+ * @param object $term
+ *   Term object for lake.
+ *
+ * @return object
+ *   Term object.
+ */
+function fish_report_save_lake($term) {
+  if (!empty($term->link)) {
+    $request = drupal_http_request($term->link);
+    if (!isset($request->error)) {
+      $raw_html = $request->data;
+      if (preg_match("/<div id=\"lat.*?display\: none;\">(.*?)<\/div></si",$raw_html,$lat)
+          && preg_match("/<div id=\"long.*?display\: none;\">(.*?)<\/div>/si",$raw_html,$lon)) {
+        $term->field_location[LANGUAGE_NONE][] = array(
+          'lat' => $lat[1],
+          'lon' => $lon[1],
+        );
+      }
+    }
+    unset($term->link);
+  }
+  taxonomy_term_save($term);
+  return $term;
+}
+
+/**
+ * Process Individual.
+ *
+ * This takes a set of reports from a lake (there can be multiple reports/paragraphs
+ * per lake) and breaks them down into individual reports, scored by fish and
+ * saved in hash.
+ *
+ * @param int $nid
+ *   Node id for overall report.
+ * @param string $text
+ *   Raw report HTML text.
+ * @param int $date
+ *   Date of report.
+ * @param bool $save
+ *   Save report.
+ *
+ * @return array
+ *   Array of reports
+ */
+function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
+  // Each report is a paragraph. Get all html removed, then parse by line.
+  $filtered_data = array();
+  $all_reports = array();
+  $lakes = fish_report_parse_build_term_data('lake');
+  $text = fish_report_parse_clean($text);
+  preg_match("/<div class=\"e2ma-layout-wrap\">(.*?)<\/div><\/span><\/td>/si", $text, $filtered_data);
+  if (empty($filtered_data)) {
+    preg_match("/name=\"central\".*?>Central Arkansas(.*?)<\/tbody><\/table>/si", $text, $filtered_data);
+  }
+  if (empty($filtered_data)) {
+    preg_match("/name=\"central-arkansas\".*?>(.*?)e2ma-design-option-footer/si", $text, $filtered_data);
+  }
+  $all_reports = explode("\n", $filtered_data[1]);
+  $all_reports = array_filter($all_reports, 'fish_report_parse_remove_titles');
+  $all_reports = array_filter($all_reports);
+  $current_lake_tid = '';
+  $current_lake_name = '';
+  $reports_to_return = array();
+  foreach ($all_reports as $report) {
+    $report = trim(strip_tags($report));
+    if (!empty($report)) {
+      if (in_array($report, $lakes)) {
+        $current_lake_tid = array_search($report, $lakes);
+        $current_lake_name = $report;
+      }
+      else {
+        if (!empty($current_lake_tid)) {
+          $report_date = array();
+          $report_is_savable = TRUE;
+          // Later reports include 'update on' string we can use to only get new reports.
+          // @todo: older reports should ignore this and process anyway.
+          if (preg_match('/\(Updated (on |)(.*?)\)/i', $report, $report_date)) {
+            $report_date[2] = str_replace('-', '/', $report_date[2]);
+            if (strtotime($report_date[2]) >= ($date - (86400 * 6))) {
+              $report_is_savable = TRUE;
+            }
+            else {
+              $report_is_savable = FALSE;
+            }
+          }
+          if ($report_is_savable === TRUE) {
+            $fishing = fish_report_parse_process_fish($report);
+            $hash = md5($date . $report);
+            $new_report = array(
+              'lake' => $current_lake_name,
+              'lake_tid' => $current_lake_tid,
+              'report' => $report,
+              'fishing' => $fishing,
+              'date' => $date,
+              'nid' => $nid,
+            );
+
+            // $save tells the form to save now, or return data for form/processing.
+            if ($save === TRUE) {
+              fish_report_save_report($new_report);
+            }
+            else {
+              // @todo: is there a better way to do this?
+              // This groups reports by lake.
+              if (!array_key_exists($current_lake_tid, $reports_to_return)) {
+                $reports_to_return[$current_lake_tid] = array();
+                $reports_to_return[$current_lake_tid]['hashes'] = array();
+                $reports_to_return[$current_lake_tid]['data'] = array();
+                $reports_to_return[$current_lake_tid]['lake_name'] = $current_lake_name;
+              }
+              $reports_to_return[$current_lake_tid]['data'][$hash] = $new_report;
+              // Format the fish report array + report string for form display.
+              $fishing_array = array();
+              foreach ($new_report['fishing'] as $fish) {
+                $fishing_array[] = $fish['fish_string'] . " are " . $fish['condition_string'];
+              }
+              // This is for the form ajax.
+              $reports_to_return[$current_lake_tid]['hashes'][$hash . '-save'] = $new_report['report'] . theme('item_list', array('items' => $fishing_array));
+              $reports_to_return[$current_lake_tid]['hashes'][$hash . '-delete'] = t('delete');
+              // Save the report object to cache by hash.
+              if (!($cache = cache_get('report - ' . $hash))) {
+                cache_set('report - ' . $hash, $new_report, 'cache');
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if ($save === FALSE) {
+    return $reports_to_return;
+  }
+}
+
+/**
+ * Save Report.
+ *
+ * Saves individual reports.
+ *
+ * @param array $report
+ *   Indexed array of report to save.
+ */
+function fish_report_save_report($report) {
+  $node = new stdClass();
+  $node->title = $report['lake'] . ' fishing report for ' . date('Y-m-d', $report['date']);
+  $node->type = 'report';
+  node_object_prepare($node);
+  $node->language = LANGUAGE_NONE;
+  $node->uid = 1;
+  $node->body[$node->language][0]['value'] = $report['report'];
+  $node->field_date[$node->language][]['value'] = $report['date'];
+  $node->field_weekly_from[$node->language][]['target_id'] = $report['nid'];
+  node_save($node);
+  $report_nid = $node->nid;
+  foreach ($report['fishing'] as $fish_and_condition) {
+    // Fishing Report node save.
+    $node = new stdClass();
+    $node->title = $fish_and_condition['fish_string'] . ' report for ' . $report['lake'] . ' on ' . date('Y-m-d', $report['date']);
+    $node->type = 'fishing_report';
+    node_object_prepare($node);
+    $node->language = LANGUAGE_NONE;
+    $node->uid = 1;
+    $node->field_date[$node->language][]['value'] = $report['date'];
+    $node->field_fish[$node->language][]['tid'] = $fish_and_condition['fish'];
+    $node->field_lake[$node->language][]['tid'] = $report['lake_tid'];
+    $node->field_condition[$node->language][]['tid'] = $fish_and_condition['condition'];
+    $node->field_from_report[$node->language][]['target_id'] = $report_nid;
+    node_save($node);
+  }
+}
+
+/**
+ * Process Fish
+ *
+ * Builds fish condition object.
+ *
+ * @param string $text
+ *   Raw text from website.
+ *
+ * @return array
+ *   Array of fish => report.
+ */
+function fish_report_parse_process_fish($report) {
+  $fishes = fish_report_parse_build_term_data('fish_type');
+  $conditions = fish_report_parse_build_term_data('condition');
+  $fishing_report = array();
+  foreach ($fishes as $fish_tid => $fish) {
+    if (stripos($report, $fish) !== FALSE) {
+      foreach ($conditions as $condition_tid => $condition) {
+        if (stripos($report, $condition) !== FALSE) {
+          if (preg_match("/" . $fish . "(ing|)( fishing| reports|) (are|is|have\sbeen|has\sbeen)(\sbiting|\sdone|)(\sfairly|\svery|) " . $condition . "(\s|\.)/i", $report)) {
+            $fishing_report[] = array(
+              'fish' => $fish_tid,
+              'fish_string' => $fish,
+              'condition' =>$condition_tid,
+              'condition_string' =>$condition,
+            );
+            // @todo: Bait
+            // "on (wax worms) and (Power Bait) as well as (nightcrawlers)."
+            break;
+          }
+        }
+      }
+    }
+  }
+  return $fishing_report;
+}
+
+/**
+ * Cleans String.
+ *
+ * Cleans string of bad data.
+ *
+ * @param string $text
+ *   Raw text from website.
+ *
+ * @return string
+ *   Cleans string.
+ */
+function fish_report_parse_clean($text) {
+  $text = str_replace(" ", "", $text);
+  return $text;
+}
+
+/**
+ * Builds taxonomy conditions and stores in memory.
+ *
+ * @return array
+ *   Array of conditions.
+ */
+function fish_report_parse_build_term_data($vocab_name) {
+  $$vocab_name = drupal_static(__FUNCTION__);
+  if (!isset($$vocab_name)) {
+    $$vocab_name = array();
+    $vid = db_select('taxonomy_vocabulary', 'tv')
+      ->fields('tv', array('vid'))
+      ->condition('machine_name', $vocab_name)
+      ->execute()
+      ->fetchColumn();
+    $options = array();
+    if ($vid) {
+      $tid = db_select('taxonomy_term_data', 'ttd')
+        ->fields('ttd',  array('tid', 'name'))
+        ->condition('vid', $vid)
+        ->orderBy('weight', 'ASC')
+        ->execute()
+        ->fetchAllKeyed();
+      if ($tid) {
+        foreach ($tid as $term_tid => $term_name) {
+          ${$vocab_name}[$term_tid] = $term_name;
+        }
+      }
+    }
+  }
+  return $$vocab_name;
+}
+
+/**
+ * Remove title.
+ *
+ * Callback from array_filter to remove strings..
+ *
+ * @param string $var
+ *   Array elements.
+ *
+ * @return bool
+ *   True or False to remove.
+ */
+function fish_report_parse_remove_titles($var) {
+  if (stripos($var, 'font-size: 14pt') !== FALSE || stripos($var, 'Army Corps of Engineers reports the') !== FALSE) {
+    return FALSE;
+  }
+  return TRUE;
+}
