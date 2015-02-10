@@ -76,7 +76,7 @@ function fish_report_parse_display() {
     $report_items = entity_load('node', $report_item_nids);
   }
   foreach ($report_items as $node) {
-    dpm("looking at report " . $node->title);
+    //dpm("looking at report " . $node->title);
     $body = field_get_items('node', $node, 'body');
     $date = field_get_items('node', $node, 'field_date');
     // We only want to parse when the user selects it, this will do it automatically.
@@ -176,15 +176,15 @@ function fish_report_parse_lake_callback($form, $form_state) {
  *   Form api.
  */
 function fish_report_parse_reports_form($form, &$form_state, $reports) {
+  dpm('form builder');
   // @todo: foreach here indicates multiple weekly reports could be passed in. How
   // is this handled if it's more than one week?
-  dpm($reports);
   foreach ($reports as $report) {
     // Is there an argument to be made to not do this logic here?
     // $reports is a group of lake reports (1 thru n), maybe that should be passed in instead?
     // This saves each lake's report in cache with a hash uid.
+    // @todo: ajax callback could make this expensive. Move it.
     $lake_reports = fish_report_parse_individual($report['nid'], $report['body'], $report['date'], FALSE);
-    dpm($lake_reports);
     if (!empty($lake_reports)) {
       $form['reports'][$report['nid']] = array(
         '#type' => 'fieldset',
@@ -224,7 +224,7 @@ function fish_report_parse_reports_form($form, &$form_state, $reports) {
  * Weekly Reports form callback.
  */
 function fish_report_parse_reports_callback($form, $form_state) {
-  return $form['reports']['selected_report'];
+  return $form['reports'];
 }
 
 // Below here a mixture of old and new saving functions. Save == true indicates
