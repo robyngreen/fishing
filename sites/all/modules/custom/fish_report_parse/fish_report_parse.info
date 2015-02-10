@@ -1,6 +1,6 @@
 name = Fish Report Parser
 description = Parses weekly fishing reports.
 core = 7.x
-package = FISH
+package = Fish
 version = 7.x-1.0
 project = fish_report_parse
