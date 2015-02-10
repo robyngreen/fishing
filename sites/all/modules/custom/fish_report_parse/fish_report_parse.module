@@ -531,6 +531,8 @@ function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
         if (!empty($current_lake_tid)) {
           $report_date = array();
           $report_is_savable = TRUE;
+          // Later reports include 'update on' string we can use to only get new reports.
+          // @todo: older reports should ignore this and process anyway.
           if (preg_match('/\(Updated (on |)(.*?)\)/i', $report, $report_date)) {
             $report_date[2] = str_replace('-', '/', $report_date[2]);
             if (strtotime($report_date[2]) >= ($date - (86400 * 6))) {
@@ -542,7 +544,7 @@ function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
           }
           if ($report_is_savable === TRUE) {
             $fishing = fish_report_parse_process_fish($report);
-            $hash = md5($report);
+            $hash = md5($date . $report);
             $new_report = array(
               'lake' => $current_lake_name,
               'lake_tid' => $current_lake_tid,
@@ -551,6 +553,8 @@ function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
               'date' => $date,
               'nid' => $nid,
             );
+
+            // $save tells the form to save now, or return data for form/processing.
             if ($save === TRUE) {
               fish_report_save_report($new_report);
             }
@@ -564,8 +568,14 @@ function fish_report_parse_individual($nid, $text, $date, $save = TRUE) {
                 $reports_to_return[$current_lake_tid]['lake_name'] = $current_lake_name;
               }
               $reports_to_return[$current_lake_tid]['data'][$hash] = $new_report;
+              // Format the fish report array + report string for form display.
+              $fishing_array = array();
+              foreach ($new_report['fishing'] as $fish) {
+                $fishing_array[] = $fish['fish_string'] . " are " . $fish['condition_string'];
+              }
               // This is for the form ajax.
-              $reports_to_return[$current_lake_tid]['hashes'][$hash] = $new_report['report'];
+              $reports_to_return[$current_lake_tid]['hashes'][$hash . '-save'] = $new_report['report'] . theme('item_list', array('items' => $fishing_array));
+              $reports_to_return[$current_lake_tid]['hashes'][$hash . '-delete'] = t('delete');
               // Save the report object to cache by hash.
               if (!($cache = cache_get('report - ' . $hash))) {
                 cache_set('report - ' . $hash, $new_report, 'cache');
@@ -604,7 +614,7 @@ function fish_report_save_report($report) {
   foreach ($report['fishing'] as $fish_and_condition) {
     // Fishing Report node save.
     $node = new stdClass();
-    $node->title = $fish_and_condition['fish_name'] . ' report for ' . $report['lake'] . ' on ' . date('Y-m-d', $report['date']);
+    $node->title = $fish_and_condition['fish_string'] . ' report for ' . $report['lake'] . ' on ' . date('Y-m-d', $report['date']);
     $node->type = 'fishing_report';
     node_object_prepare($node);
     $node->language = LANGUAGE_NONE;
@@ -626,8 +636,8 @@ function fish_report_save_report($report) {
  * @param string $text
  *   Raw text from website.
  *
- * @return string
- *   Cleans string.
+ * @return array
+ *   Array of fish => report.
  */
 function fish_report_parse_process_fish($report) {
   $fishes = fish_report_parse_build_term_data('fish_type');
@@ -637,14 +647,14 @@ function fish_report_parse_process_fish($report) {
     if (stripos($report, $fish) !== FALSE) {
       foreach ($conditions as $condition_tid => $condition) {
         if (stripos($report, $condition) !== FALSE) {
-          if (preg_match("/" . $fish . "(ing|)( fishing| reports|) (are|is|have\sbeen)(\sbiting|\sdone|)(\sfairly|\svery|) " . $condition . "(\s|\.)/i", $report)) {
+          if (preg_match("/" . $fish . "(ing|)( fishing| reports|) (are|is|have\sbeen|has\sbeen)(\sbiting|\sdone|)(\sfairly|\svery|) " . $condition . "(\s|\.)/i", $report)) {
             $fishing_report[] = array(
               'fish' => $fish_tid,
-              'fish_name' => $fish,
+              'fish_string' => $fish,
               'condition' =>$condition_tid,
-              'condition_name' =>$condition,
+              'condition_string' =>$condition,
             );
-            // Bait:
+            // @todo: Bait
             // "on (wax worms) and (Power Bait) as well as (nightcrawlers)."
             break;
           }
