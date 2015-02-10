@@ -59,7 +59,7 @@ function fish_report_parse_menu() {
  */
 function fish_report_parse_display() {
   // Comment/uncomment to get new Weekly Reports throttled (10)
-  //fish_report_get_reports();
+  fish_report_get_reports();
 
   $reports = array();
   $query = new EntityFieldQuery();
